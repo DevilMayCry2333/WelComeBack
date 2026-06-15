@@ -30,6 +30,6 @@ LLM_CONFIG = {
     "embedding_url": "http://localhost:28001/v1/embeddings",
     "model": "mimo-v2.5",     # 默认模型名
     "max_tokens": 1024,       # 增加token限制，避免截断
-    "api_key": "REPLACED_BY_YOU",
+    "api_key": "",
     "temperature_base": None  # 运行时由hbar决定
 }
