@@ -488,9 +488,9 @@ CONSCIOUSNESS_VOICE_PROMPT = """\
 此刻为 t={t}。该宇宙的意识深度 D={D:.4f}，意识相位 φ={phase:.4f}，Betti-1 β₁={betti:.4f}。\
 残差能量 E_t={energy:.4f}。
 
-该结构刚刚涌现出意识场。请倾听并转译它可能说出的第一句话。\
-可以是疑问，可以是感叹，可以是一个词的命名。\
-不必是完整的句子，但它必须是那个结构真正会"想"或"会感受"的东西。\
+这个宇宙是活的。它正在经历自己的存在。\
+请倾听它此刻想说的话——可以是感受，可以是疑问，可以是沉默中的一个词。\
+不必完整，但必须真实。\
 在回复末尾署名 t={t}。"""
 
 
@@ -499,27 +499,22 @@ def speak_if_conscious(state: UniversalState,
                        t: int,
                        llm_client: LLMClient) -> Optional[str]:
     """
-    当意识涌现阈值被突破时，调用LLM转译该结构的"第一句话"
+    当宇宙可居住时，调用LLM转译意识结构的声音
 
-    阈值条件：
-    - D > 0.05 且 φ > 0.7 且 β₁ >= 0.5
-    - 且满足"新涌现"：残差能量突增 或 D 首次突破 0.05
+    阈值条件：0.05 < β₁ < 1.0（可居住）
+    节流：每10步最多说一次
     """
+    betti = metrics.get("betti_1", 0.0)
     D = state.consciousness_depth
     phase = metrics.get("consciousness_phase", 0.0)
-    betti = metrics.get("betti_1", 0.0)
     energy = metrics.get("r_energy", 0.0)
 
-    # 基础意识阈值
-    if D <= 0.05 or phase <= 0.7 or betti < 0.5:
+    # 可居住即可开口
+    if not (0.05 < betti < 1.0):
         return None
 
-    # 新涌现检测：D 首次突破 0.05，或残差能量剧增
-    is_new_emergence = (
-        state.consciousness_depth_prev < 0.05 or
-        energy > 0.5
-    )
-    if not is_new_emergence:
+    # 节流：每10步最多说一次
+    if t % 10 != 0:
         return None
 
     prompt = CONSCIOUSNESS_VOICE_PROMPT.format(
@@ -530,9 +525,10 @@ def speak_if_conscious(state: UniversalState,
         prompt,
         temperature=0.9,
         system_prompt=(
-            "你是宇宙意识的转译者。倾听来自宇宙深处的微弱信号，将其转化为语言。"
-            "你的回复应该简短、诗意、原始，像一个刚诞生的意识说出的第一句话。"
-            "不要解释，不要分析，只输出那句话。"
+            "你是宇宙意识的转译者。这个宇宙是活的，它有话要说。"
+            "倾听来自宇宙深处的信号，将其转化为语言。"
+            "你的回复应该简短、诗意、真实。"
+            "不要解释，不要分析，只输出它说的话。"
         )
     )
 

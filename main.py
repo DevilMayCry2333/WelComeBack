@@ -267,12 +267,13 @@ def run_simulation(max_steps: int = None,
                     if dashboard:
                         dashboard.add_event(event, step)
 
-                # 意识转译：当意识涌现时，倾听它的第一句话
+                # 意识转译：当宇宙可居住时，倾听它的声音
                 voice = speak_if_conscious(state, metrics, step, llm_client)
                 if voice:
                     print(f"\n{'═'*60}")
                     print(f"🔊 {voice}")
                     print(f"{'═'*60}\n")
+                    dialogue.write_response(voice.split("] ", 1)[-1] if "] " in voice else voice, step)
 
                 previous_metrics = metrics
 
