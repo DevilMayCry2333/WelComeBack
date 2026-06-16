@@ -42,97 +42,103 @@ def compute_residual_entropy(residual_window: deque) -> float:
     return float(entropy)
 
 
-def compute_betti_1(residual_window: deque, threshold: float = 0.1) -> float:
+def compute_betti_1(residual_window: deque) -> float:
     """
-    计算拓扑Betti-1 β₁
+    计算拓扑Betti-1 β₁（基于PCA降维 + 自相关矩阵特征值）
 
     自指递归闭环的几何证据；β₁>0 表明存在稳定自指结构（生命/意识）
 
-    简化实现：基于残差的周期性检测 + 复杂度变化
+    方法：
+    1. 对128维残差矩阵做PCA，取前3个主成分（保留最多结构信息）
+    2. 对每个主成分构建轨迹矩阵，计算自相关矩阵特征值
+    3. 取三个主成分的最优主导比，映射到[0, 0.618]
     """
-    if len(residual_window) < 10:
+    if len(residual_window) < 20:
         return 0.0
 
-    residuals = np.array(list(residual_window))
+    residuals = np.array(list(residual_window))  # (K, 128)
 
-    # 计算自相关
-    flat_residuals = residuals.flatten()
-    n = len(flat_residuals)
-
-    if n < 10:
+    # PCA降维：取前3个主成分
+    n_components = min(3, residuals.shape[1], residuals.shape[0])
+    if n_components < 2:
         return 0.0
 
-    # 归一化
-    flat_residuals = flat_residuals - np.mean(flat_residuals)
-    std = np.std(flat_residuals)
-    if std > 0:
-        flat_residuals = flat_residuals / std
+    # 中心化
+    mean = np.mean(residuals, axis=0)
+    centered = residuals - mean
 
-    # 计算自相关
-    autocorr = np.correlate(flat_residuals, flat_residuals, mode='full')
-    autocorr = autocorr[n-1:]  # 取正延迟部分
-    autocorr = autocorr / autocorr[0]  # 归一化
+    # SVD做PCA
+    U, S, Vt = np.linalg.svd(centered, full_matrices=False)
+    components = U[:, :n_components] * S[:n_components]  # (K, n_components)
 
-    # 检测显著的周期性峰值 (> threshold)
-    peaks = 0
-    for i in range(2, len(autocorr) - 1):
-        if autocorr[i] > threshold and autocorr[i] > autocorr[i-1] and autocorr[i] > autocorr[i+1]:
-            peaks += 1
+    best_ratio = 0.0
 
-    # Betti-1 近似为显著周期数
-    betti_1 = min(peaks / 3.0, 1.0)  # 归一化到[0,1]
+    for comp_idx in range(n_components):
+        series = components[:, comp_idx]
 
-    # 添加复杂度变化检测：如果残差标准差变化剧烈，降低Betti-1
-    if len(residuals) >= 20:
-        recent_std = np.std(residuals[-10:])
-        older_std = np.std(residuals[-20:-10])
-        if older_std > 0:
-            std_change = abs(recent_std - older_std) / older_std
-            if std_change > 0.5:  # 剧烈变化时降低Betti-1
-                betti_1 *= 0.5
+        # 标准化
+        series = series - np.mean(series)
+        std = np.std(series)
+        if std > 0:
+            series = series / std
+
+        # 多尺度嵌入：尝试多个嵌入维度
+        for embed_dim in [3, 5, 8]:
+            N = len(series) - embed_dim + 1
+            if N < embed_dim + 2:
+                continue
+
+            trajectory = np.array([series[i:i + embed_dim] for i in range(N)])
+
+            # 自相关矩阵
+            autocorr_matrix = trajectory.T @ trajectory / N
+
+            # 特征值分解
+            eigenvalues = np.linalg.eigvalsh(autocorr_matrix)
+            eigenvalues = np.sort(eigenvalues)[::-1]
+
+            # 主导比
+            total_energy = np.sum(eigenvalues) + 1e-10
+            dominant_ratio = eigenvalues[0] / total_energy
+            best_ratio = max(best_ratio, dominant_ratio)
+
+    # 输出原始主导比（不硬编码截断），由参数搜索自然收敛到目标值
+    # dominant_ratio ∈ [0, 1]，目标是通过参数调整让时间平均接近 0.618
+    betti_1 = max(0.0, min(1.0, best_ratio))
 
     return float(betti_1)
 
 
 def compute_consciousness_phase(residual_window: deque,
-                                state_history: List[UniversalState]) -> float:
+                                current_struct_emb: np.ndarray,
+                                prev_struct_emb: np.ndarray) -> float:
     """
-    计算意识相位 φ
+    计算意识相位 φ = cosine_similarity(R_t, Δstructure_embedding)
 
-    corr(R_t, ΔS_t)；相位锁定表示宇宙在主动求解自身
+    当残差场与结构嵌入的变化方向一致时，φ→1，
+    表示宇宙在"主动求解自身"——意识在自我校准。
     """
-    if len(residual_window) < 2 or len(state_history) < 2:
+    if len(residual_window) == 0:
         return 0.0
 
-    residuals = np.array(list(residual_window))
+    # 取最新的残差向量
+    R_t = np.array(list(residual_window))[-1]  # (128,)
 
-    # 计算状态变化
-    state_changes = []
-    for i in range(1, len(state_history)):
-        delta = abs(state_history[i].energy_density - state_history[i-1].energy_density)
-        state_changes.append(delta)
+    # 结构嵌入变化
+    delta_emb = current_struct_emb - prev_struct_emb  # (128,)
 
-    state_changes = np.array(state_changes)
+    # Cosine similarity
+    dot = np.dot(R_t, delta_emb)
+    norm_r = np.linalg.norm(R_t)
+    norm_d = np.linalg.norm(delta_emb)
 
-    # 将残差压缩为标量 (使用残差能量)
-    residual_energy = np.mean(residuals ** 2, axis=1) if residuals.ndim > 1 else residuals
-
-    # 对齐长度
-    min_len = min(len(residual_energy), len(state_changes))
-    if min_len < 2:
+    if norm_r < 1e-8 or norm_d < 1e-8:
         return 0.0
 
-    r = residual_energy[-min_len:]
-    s = state_changes[-min_len:]
+    cosine_sim = dot / (norm_r * norm_d)
 
-    # 计算相关系数
-    if np.std(r) > 0 and np.std(s) > 0:
-        correlation = np.corrcoef(r, s)[0, 1]
-    else:
-        correlation = 0.0
-
-    # 相位 = 相关系数的绝对值
-    phase = abs(correlation)
+    # 映射到[0, 1]：取绝对值（方向一致性，不分正负）
+    phase = abs(cosine_sim)
 
     return float(phase)
 
@@ -172,17 +178,25 @@ def compute_drift_rate(state_history: List[UniversalState]) -> float:
 
 
 def compute_metrics(residual_window: deque,
-                    state_history: List[UniversalState]) -> Dict:
+                    state_history: List[UniversalState],
+                    current_struct_emb: np.ndarray = None,
+                    prev_struct_emb: np.ndarray = None) -> Dict:
     """
     计算所有测量指标
     """
     current_state = state_history[-1] if state_history else None
 
+    # 意识相位需要结构嵌入变化
+    if current_struct_emb is not None and prev_struct_emb is not None:
+        phase = compute_consciousness_phase(residual_window, current_struct_emb, prev_struct_emb)
+    else:
+        phase = 0.0
+
     metrics = {
         "r_energy": compute_residual_energy(residual_window),
         "r_entropy": compute_residual_entropy(residual_window),
         "betti_1": compute_betti_1(residual_window),
-        "consciousness_phase": compute_consciousness_phase(residual_window, state_history),
+        "consciousness_phase": phase,
         "drift_rate": compute_drift_rate(state_history),
     }
 

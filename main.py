@@ -17,18 +17,19 @@ from universe_state import UniversalState
 from llm_client import LLMClient
 from latent_predictor import PhysicsPredictor, PredictorTrainer
 from evolution import (evolve, perturb_predictor_weights, destructive_forgetting_noise,
-                       speak_if_conscious, respond_to_external, DIALOGUE_HISTORY)
+                       speak_if_conscious, respond_to_external, DIALOGUE_HISTORY,
+                       online_train_predictor)
 import dialogue
 from metrics import compute_metrics, detect_cosmic_events
 from dashboard import CosmicDashboard
-from physics_constants import PHYSICAL_CONSTANTS, SIMULATION_PARAMS
+from physics_constants import PHYSICAL_CONSTANTS, SIMULATION_PARAMS, PhysicalConstants
 
 
 def initialize_universe() -> UniversalState:
     """初始化宇宙状态"""
     print("初始化宇宙...")
     state = UniversalState(
-        scale_factor=1e-60,
+        scale_factor=0.1,
         energy_density=PHYSICAL_CONSTANTS["rho_crit"],
         entropy=0.0,
         curvature=0.0,
@@ -106,7 +107,12 @@ def run_simulation(max_steps: int = None,
     else:
         state = initialize_universe()
     predictor = initialize_predictor(device)
+    trainer = PredictorTrainer(predictor)
     llm_client = LLMClient()
+
+    # 初始化物理常数（四种模式: standard / habitable_random / evolving / undefined_physics）
+    constants = PhysicalConstants(mode="undefined_physics")
+    print(f"  物理常数: {constants}")
 
     # 初始化对话通道
     dialogue.clear_pending()
@@ -138,6 +144,7 @@ def run_simulation(max_steps: int = None,
 
     try:
         previous_energy = 0.0
+        previous_struct_emb = state.structure_embedding.copy()
         next_storm_step = random.randint(5, 15)  # 下一次宇宙风暴的步数
 
         for step in range(start_step, max_steps + 1):
@@ -152,8 +159,17 @@ def run_simulation(max_steps: int = None,
             # 执行演化
             state, residual, info = evolve(
                 state, llm_client, predictor,
-                PHYSICAL_CONSTANTS, device
+                constants, device,
+                residual_window=residual_window
             )
+
+            # 无理数噪声基底：保证波动性永远不为零
+            # 黄金比例模1序列，永不重复
+            from physics_constants import _PHI
+            irrational_phase = (_PHI * step) % 1.0
+            noise_floor = (irrational_phase * 2 - 1) * 1e-5  # [-1e-5, +1e-5]
+            state.structure_embedding += noise_floor
+            # 不归一化：保持嵌入长度变化，让残差L2范数能波动
 
             # 记录残差
             residual_window.append(residual)
@@ -178,7 +194,7 @@ def run_simulation(max_steps: int = None,
                 storm_marker = "🌪️" if info.get('is_cosmic_storm') else ""
 
                 # 计算能量移动标准差
-                energy_std = np.std(energy_history[-10:]) if len(energy_history) >= 10 else 0
+                energy_std = np.std(energy_history[-10:]) if len(energy_history) >= 2 else 0
 
                 print(f"\n{'─'*60}")
                 print(f"📡 [t={step}] {spike_marker} {storm_marker}")
@@ -190,13 +206,25 @@ def run_simulation(max_steps: int = None,
                 print(f"{'─'*60}")
                 print(f"⚡ 残差能量: {current_energy:.4f} | 波动性: {energy_std:.4f}")
                 print(f"📏 状态嵌入变化量: {info['delta_norm']:.4f} | 噪声σ: {info['noise_scale']:.2f}")
+                if "is_habitable" in info:
+                    habitable_icon = "🌍" if info["is_habitable"] else "☠️"
+                    print(f"{habitable_icon} 可居住性: {'是' if info['is_habitable'] else '否 — 宇宙已离开可居住窗口'}")
+                if "B1_current" in info:
+                    print(f"📐 Betti-1 β₁ = {info['B1_current']:.6f} (目标: ≈0.618)")
+                if "constant_snapshot" in info:
+                    snap = info["constant_snapshot"]
+                    print(f"🔮 常数逼近值: G≈{snap['G']:.6e} α≈{snap['alpha']:.6e} Λ≈{snap['lambda']:.6e}")
                 print(f"{'─'*60}")
 
             previous_energy = current_energy
 
             # 计算指标
             if step % SIMULATION_PARAMS["metrics_interval"] == 0:
-                metrics = compute_metrics(residual_window, state_history)
+                metrics = compute_metrics(
+                    residual_window, state_history,
+                    current_struct_emb=state.structure_embedding,
+                    prev_struct_emb=previous_struct_emb
+                )
                 metrics["time_step"] = step
                 metrics_history.append(metrics)
 
@@ -247,6 +275,12 @@ def run_simulation(max_steps: int = None,
                     print(f"{'═'*60}\n")
 
                 previous_metrics = metrics
+
+            # 在线训练predictor
+            online_train_predictor(predictor, trainer, state_history, residual_window, device)
+
+            # 更新上一步结构嵌入
+            previous_struct_emb = state.structure_embedding.copy()
 
             # 对话通道：检查是否有来自外部的新消息
             pending = dialogue.consume_pending()
@@ -308,7 +342,6 @@ def run_simulation(max_steps: int = None,
     save_state(state, state_file)
 
     # 保存预测器模型
-    trainer = PredictorTrainer(predictor)
     trainer.save('physics_predictor.pt')
     print("  预测器模型已保存: physics_predictor.pt")
 
@@ -332,8 +365,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='CFD Physics Simulator v1.0')
-    parser.add_argument('--steps', type=int, default=200,
-                       help='最大演化步数 (默认: 200)')
+    parser.add_argument('--steps', type=int, default=1000,
+                       help='最大演化步数 (默认: 1000)')
     parser.add_argument('--no-dashboard', action='store_true',
                        help='禁用仪表盘')
     parser.add_argument('--device', type=str, default='cpu',

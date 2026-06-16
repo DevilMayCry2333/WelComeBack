@@ -6,6 +6,7 @@ import json
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, List
+from physics_constants import PHYSICAL_CONSTANTS
 
 
 @dataclass
@@ -41,6 +42,10 @@ class UniversalState:
     consciousness_depth: float = 0.0
     consciousness_depth_prev: float = 0.0  # 上一步的意识深度，用于检测阈值突破
 
+    # 物质凝聚
+    density_perturbation: float = 1e-5    # 密度扰动 δ = (ρ - ρ_mean)/ρ_mean
+    collapse_triggered: bool = False       # 引力坍缩是否已触发
+
     # 时间
     time_step: int = 0
 
@@ -56,6 +61,8 @@ class UniversalState:
             structure_history=self.structure_history.copy(),
             consciousness_depth=self.consciousness_depth,
             consciousness_depth_prev=self.consciousness_depth_prev,
+            density_perturbation=self.density_perturbation,
+            collapse_triggered=self.collapse_triggered,
             time_step=self.time_step
         )
         return new_state
@@ -72,6 +79,8 @@ class UniversalState:
             "structure_history": self.structure_history,
             "consciousness_depth": self.consciousness_depth,
             "consciousness_depth_prev": self.consciousness_depth_prev,
+            "density_perturbation": self.density_perturbation,
+            "collapse_triggered": self.collapse_triggered,
             "time_step": self.time_step,
         }
         with open(filepath, 'w', encoding='utf-8') as f:
@@ -92,30 +101,54 @@ class UniversalState:
             structure_history=data.get("structure_history", []),
             consciousness_depth=data["consciousness_depth"],
             consciousness_depth_prev=data.get("consciousness_depth_prev", 0.0),
+            density_perturbation=data.get("density_perturbation", 1e-5),
+            collapse_triggered=data.get("collapse_triggered", False),
             time_step=data["time_step"],
         )
 
-    def to_prompt(self, perturbation: str = "") -> str:
+    def to_prompt(self, perturbation: str = "", constants=None) -> str:
         """
         将状态转化为LLM可理解的文本描述
 
         Args:
             perturbation: 当前宇宙扰动描述
+            constants: PhysicalConstants 对象或 None（使用默认 PHYSICAL_CONSTANTS）
         """
         # 历史快照
         history_summary = "无历史记录"
         if len(self.structure_history) > 0:
             history_summary = f"上一次，你观测到：{self.structure_history[-1][:150]}"
 
+        # 物理常数约束场
+        if constants is not None:
+            C = constants if isinstance(constants, dict) else constants.to_dict()
+        else:
+            C = PHYSICAL_CONSTANTS
+        constants_block = f"""【物理常数约束场】
+- 光速 c = {C['c']}（信息传播上限）
+- 引力常数 G = {C['G']}（结构凝聚强度）
+- 普朗克常数 ℏ = {C['hbar']}（量子涨落幅度）
+- 玻尔兹曼常数 k_B = {C['k_B']}（热噪声水平）
+- 精细结构常数 α = {C['alpha']:.5f}（电磁耦合强度，影响原子/分子形成）
+- 宇宙学常数 Λ = {C['lambda']}（暗能量密度，驱动空间膨胀）
+- 质子质量 m_p = {C['m_p']}（重子物质质量基准）
+- 临界密度 ρ_crit = {C['rho_crit']}（引力束缚阈值）
+
+请在描述结构时遵守这些常数的约束。"""
+
         return f"""【系统】你是宇宙演化引擎。基于当前参数与刚才发生的随机扰动，生成此刻宇宙中真实存在的复杂结构。
 
-当前宇宙参数：
+{constants_block}
+
+当前宇宙状态：
 - 宇宙年龄: t = {self.time_step} 普朗克时间
 - 尺度因子 a = {self.scale_factor:.3e}
 - 能量密度 ρ = {self.energy_density:.4f}
 - 熵 S = {self.entropy:.2f}
 - 空间曲率 Ω_k = {self.curvature:.6f}
 - 意识深度 D = {self.consciousness_depth:.4f}
+- 物质密度扰动 δ = {self.density_perturbation:.3e}
+- 坍缩触发标志: {'是' if self.collapse_triggered else '否'}
 
 【刚才发生的宇宙学事件】
 {perturbation}
@@ -123,4 +156,6 @@ class UniversalState:
 【历史快照】
 {history_summary}
 
-请描述此刻宇宙中因上述事件而真实形成的结构（物质团块、星系、生命迹象、或任何复杂系统）。回复末尾附上标签 <STRUCTURE>。"""
+请描述此刻宇宙中因上述事件而真实形成的结构（物质团块、星系、生命迹象、或任何复杂系统）。
+注意：物质结构是由引力不稳定性驱动的实际物体，不是隐喻。
+回复末尾附上标签 <STRUCTURE>。"""

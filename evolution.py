@@ -9,7 +9,14 @@ from typing import Tuple, Optional, List
 from universe_state import UniversalState
 from llm_client import LLMClient
 from latent_predictor import PhysicsPredictor
-from physics_constants import PHYSICAL_CONSTANTS, SIMULATION_PARAMS
+from physics_constants import PHYSICAL_CONSTANTS, SIMULATION_PARAMS, PhysicalConstants, _PHI, _PHI_INV
+from metrics import compute_betti_1
+
+# B1死亡连续步数追踪（模块级，跨evolve调用持久化）
+_b1_dead_steps = 0
+
+# 朴素预测器：B1死亡时用上一步embedding作为预测基准
+_prev_embedding_for_prediction = None
 
 # 宇宙扰动描述池
 COSMIC_PERTURBATIONS = [
@@ -77,8 +84,25 @@ def update_deterministic(state: UniversalState, constants: dict, dt: float) -> U
     entropy_increase = constants["k_B"] * np.log(state.scale_factor + 1) * dt
     new_state.entropy = state.entropy + entropy_increase
 
-    # 更新时间步
-    new_state.time_step = state.time_step + 1
+    # === 物质凝聚：密度扰动增长 (线性近似) ===
+    # 密度扰动 δ = (ρ - ρ_mean)/ρ_mean
+    # 增长因子 D(z) ~ 1/(1+z) 在物质主导期，即 δ ∝ a (尺度因子)
+    growth_rate = new_state.scale_factor * constants.get("G", 1.0)
+    new_state.density_perturbation *= (1.0 + growth_rate * dt)
+
+    # Jeans 质量: M_J = (π^(5/2) * cs^3) / (6 * G^(3/2) * ρ^(1/2))
+    # 假设声速 cs = 0.1*c
+    cs = 0.1 * constants.get("c", 1.0)
+    G = constants.get("G", 1.0)
+    rho = max(new_state.energy_density, 1e-10)
+    jeans_mass = (np.pi**2.5 * cs**3) / (6 * G**1.5 * rho**0.5)
+
+    # 当密度扰动超过临界值(1.68，线性理论的球对称坍缩阈值)且尚未触发过坍缩
+    if new_state.density_perturbation > 1.68 and not new_state.collapse_triggered:
+        new_state.collapse_triggered = True
+        print(f"\n*** 引力坍缩触发：第一个物质团块形成 ***")
+        print(f"    密度扰动 δ = {new_state.density_perturbation:.3e}")
+        print(f"    Jeans 质量 M_J = {jeans_mass:.3e}")
 
     return new_state
 
@@ -106,6 +130,38 @@ def compress_embedding(new_embedding: np.ndarray,
         compressed = compressed / norm
 
     return compressed
+
+
+def post_process_embedding(new_emb: np.ndarray,
+                           memory_vector: np.ndarray,
+                           G: float,
+                           attraction_strength: float = 0.15) -> np.ndarray:
+    """
+    对LLM生成的embedding施加"引力吸引"后处理
+
+    用G作为核函数强度，将新embedding向记忆向量中的已有结构吸引。
+    模拟引力使物质向已有质量中心聚集的物理过程。
+    """
+    # 将memory_vector扩展到128维（padding）
+    mem_128 = np.zeros(128)
+    mem_128[:len(memory_vector)] = memory_vector
+
+    # 计算引力吸引方向和强度
+    direction = mem_128 - new_emb
+    dist = np.linalg.norm(direction) + 1e-8
+
+    # 牛顿引力：F ∝ G / r²，但用tanh限制避免发散
+    force = G * np.tanh(1.0 / (dist + 0.01)) * attraction_strength
+
+    # 施加引力吸引
+    attracted = new_emb + force * direction / dist
+
+    # L2归一化
+    norm = np.linalg.norm(attracted)
+    if norm > 0:
+        attracted = attracted / norm
+
+    return attracted
 
 
 def update_memory(memory_vector: np.ndarray,
@@ -169,6 +225,55 @@ def destructive_forgetting_noise(predictor: PhysicsPredictor):
             param.add_(torch.randn(param.shape) * 0.1)
 
 
+def online_train_predictor(predictor, trainer, state_history, residual_window,
+                           device='cpu'):
+    """
+    在线训练predictor
+
+    每 train_every 步执行一次mini-batch训练。
+    warmup_steps 之前不训练（数据不足）。
+    """
+    from latent_predictor import PredictorTrainer
+
+    step = state_history[-1].time_step if state_history else 0
+    warmup = SIMULATION_PARAMS["warmup_steps"]
+    train_every = SIMULATION_PARAMS["train_every"]
+
+    if step < warmup:
+        return
+    if step % train_every != 0:
+        return
+    if len(state_history) < 10 or len(residual_window) < 10:
+        return
+
+    # 构建训练样本：用最近的memory序列预测下一个structure_embedding
+    window_size = min(10, len(state_history) - 1)
+
+    memories = []
+    consciousnesses = []
+    targets = []
+
+    for i in range(window_size, len(state_history)):
+        mem_seq = np.array([state_history[j].memory_vector
+                           for j in range(max(0, i - window_size), i)])
+        memories.append(mem_seq)
+        consciousnesses.append([state_history[i].consciousness_depth])
+        targets.append(state_history[i].structure_embedding)
+
+    # 转为tensor
+    memory_batch = torch.FloatTensor(np.array(memories)).to(device)
+    consciousness_batch = torch.FloatTensor(np.array(consciousnesses)).to(device)
+    target_batch = torch.FloatTensor(np.array(targets)).to(device)
+
+    # 训练5个epoch
+    total_loss = 0
+    for _ in range(5):
+        loss = trainer.train_step(memory_batch, consciousness_batch, target_batch)
+        total_loss += loss
+
+    print(f"  [t={step}] Predictor训练完成，平均loss: {total_loss / 5:.6f}")
+
+
 # 状态更新模式
 UPDATE_MODES = [
     lambda o, n, noise: 0.3*o + 0.7*n + noise,      # 偏新
@@ -182,7 +287,8 @@ def evolve(state: UniversalState,
            llm_client: LLMClient,
            predictor: PhysicsPredictor,
            constants: dict = None,
-           device: str = 'cpu') -> Tuple[UniversalState, np.ndarray, dict]:
+           device: str = 'cpu',
+           residual_window=None) -> Tuple[UniversalState, np.ndarray, dict]:
     """
     执行一步宇宙演化
 
@@ -192,92 +298,130 @@ def evolve(state: UniversalState,
         predictor: Latent Predictor
         constants: 物理常数
         device: 计算设备
+        residual_window: 残差滑动窗口（undefined_physics模式需要，用于计算B1）
 
     Returns:
         (new_state, residual, info)
     """
+    global _prev_embedding_for_prediction
     if constants is None:
         constants = PHYSICAL_CONSTANTS
 
     dt = SIMULATION_PARAMS["dt"]
     hbar = constants["hbar"]
 
-    # 1. 物理约束下的确定性演化
+    # 1. Deterministic update — Friedmann equation (skeleton)
     new_state = update_deterministic(state, constants, dt)
 
-    # 2. LLM生成复杂结构嵌入 (不可计算部分)
-    # 随机选择宇宙扰动
+    # 2. Matter perturbation feedback — structure_embedding L2 norm → energy_density
+    matter_perturbation = SIMULATION_PARAMS["matter_coupling"] * np.linalg.norm(new_state.structure_embedding)
+    new_state.energy_density += matter_perturbation * dt
+
+    # 3. LLM generation — non-computable injection (temperature 0.9~1.1)
     perturbation = random.choice(COSMIC_PERTURBATIONS)
-
-    # 构造prompt (包含扰动和历史)
-    prompt = state.to_prompt(perturbation=perturbation)
-
-    # 提升温度到0.9~1.1
+    prompt = state.to_prompt(perturbation=perturbation, constants=constants)
     temperature = random.uniform(0.9, 1.1)
     llm_text, llm_embedding, logit_entropy = llm_client.generate_with_embedding(
         prompt, temperature=temperature
     )
-
-    # 提取LLM回复中的结构描述
     llm_response_clean = llm_text.split("<STRUCTURE>")[0].strip() if "<STRUCTURE>" in llm_text else llm_text.strip()
 
-    # 3. 强制状态突变：随机选择更新模式
-    is_reheating = (state.time_step % 50 == 0) and (state.time_step > 0)
-
-    # 宇宙风暴：随机触发 (约10%概率，但不与重新加热重叠)
+    # Random update mode selection (偏新/偏旧/高噪/狂噪)
+    is_reheating = False
+    if state.collapse_triggered and state.time_step > 0:
+        if state.time_step % 100 == 0 and random.random() < 0.3:
+            is_reheating = True
     is_cosmic_storm = False
     if not is_reheating and state.time_step > 0:
-        # 随机概率触发，确保每5-15步左右会有一次
-        if random.random() < 0.1:  # 10%概率
+        if random.random() < 0.03:
             is_cosmic_storm = True
 
     if is_reheating:
-        # 💥 宇宙重新加热！所有旧结构被抹去
-        noise_scale = hbar * 50
+        noise_scale = hbar * 20
         print(f"\n💥 宇宙重新加热！所有旧结构被抹去。噪声σ={noise_scale:.1f}")
     elif is_cosmic_storm:
-        noise_scale = hbar * 20
+        noise_scale = hbar * 15
         print(f"\n🌪️ 宇宙风暴！噪声强度提升至 σ={noise_scale:.1f}")
     else:
         noise_scale = max(hbar * 5, 0.05)
 
     gaussian_noise = np.random.randn(128) * noise_scale
-
-    # 保存旧嵌入用于计算变化量
     old_embedding = state.structure_embedding.copy()
-
-    # 随机选择状态更新模式
     update_fn = random.choice(UPDATE_MODES)
     new_embedding = update_fn(state.structure_embedding, llm_embedding, gaussian_noise)
-
-    # 归一化，防止向量长度漂移
     norm = np.linalg.norm(new_embedding)
     if norm > 0:
         new_embedding = new_embedding / norm
-
     new_state.structure_embedding = new_embedding
-
-    # 计算状态嵌入变化量
     delta_norm = np.linalg.norm(new_embedding - old_embedding)
 
-    # 更新历史 (保留最近5次)
+    # 存储LLM生成后的embedding，作为下一步的朴素预测基准
+    _prev_embedding_for_prediction = new_state.structure_embedding.copy()
+
+    # Update structure history (keep last 5)
     new_state.structure_history = state.structure_history.copy()
     new_state.structure_history.append(llm_response_clean)
     if len(new_state.structure_history) > 5:
         new_state.structure_history = new_state.structure_history[-5:]
 
-    # 4. Latent Predictor θ 预测整体状态的潜向量
-    with torch.no_grad():
-        memory_tensor = torch.FloatTensor(state.memory_vector).unsqueeze(0).unsqueeze(0).to(device)
-        consciousness_tensor = torch.FloatTensor([state.consciousness_depth]).unsqueeze(1).to(device)
+    # 4. Predictor — disabled during B1 death to prevent learning the injection
+    global _b1_dead_steps
+    B1_dead = False
+    if residual_window is not None and len(residual_window) >= 20:
+        B1_probe = compute_betti_1(residual_window)
+        if B1_probe < 1e-3:
+            B1_dead = True
+    else:
+        B1_dead = True
 
-        predicted_struct = predictor(memory_tensor, consciousness_tensor)
-        predicted_struct = predicted_struct.cpu().numpy().flatten()
+    if B1_dead:
+        if _prev_embedding_for_prediction is not None:
+            predicted_struct = _prev_embedding_for_prediction.copy()
+        else:
+            predicted_struct = np.random.randn(128)
+            predicted_struct = predicted_struct / (np.linalg.norm(predicted_struct) + 1e-8)
+    elif state.time_step < SIMULATION_PARAMS["warmup_steps"]:
+        predicted_struct = new_state.structure_embedding + np.random.randn(128) * 0.1
+        predicted_struct = predicted_struct / (np.linalg.norm(predicted_struct) + 1e-8)
+    else:
+        with torch.no_grad():
+            memory_tensor = torch.FloatTensor(state.memory_vector).unsqueeze(0).unsqueeze(0).to(device)
+            consciousness_tensor = torch.FloatTensor([state.consciousness_depth]).unsqueeze(1).to(device)
+            predicted_struct = predictor(memory_tensor, consciousness_tensor)
+            predicted_struct = predicted_struct.cpu().numpy().flatten()
 
-    # 5. 残差场 R_t = 真实嵌入 - 预测嵌入 (不归一化，保持敏感度)
+    # 5. Gravitational attraction — pull embedding toward memory vector using G
+    new_state.structure_embedding = post_process_embedding(
+        new_state.structure_embedding, state.memory_vector,
+        G=constants["G"],
+        attraction_strength=SIMULATION_PARAMS["gravitational_attraction"]
+    )
+
+    # 5.5 B1 emergency revive — chaotic oscillation injection
+    if B1_dead:
+        _b1_dead_steps += 1
+        if _b1_dead_steps > 20 and residual_window is not None and len(residual_window) >= 20:
+            residual_window.clear()
+
+        # Direction: sin(step×φ + i×φ²) — changes every step, every dimension
+        step_phase = state.time_step * _PHI
+        _chaotic_dir = np.sin(step_phase + np.arange(128) * _PHI * _PHI)
+        _chaotic_dir = _chaotic_dir / (np.linalg.norm(_chaotic_dir) + 1e-8)
+        # 振幅：黄金比例基底 + 大幅随机扰动，范围[0.05, 1.5]
+        # 打破固定点：引力吸引拉回的力度有限，大幅振荡才能让残差L2范数波动
+        amplitude = 0.3 + 0.1 * np.sin(state.time_step * _PHI_INV * 2) + np.random.uniform(-0.6, 0.6)
+        amplitude = max(0.05, min(1.5, amplitude))
+        emergency_kick = _chaotic_dir * amplitude
+
+        # 不归一化：打破等距球面旋转，让嵌入长度变化，残差L2范数才能波动
+        new_state.structure_embedding = new_state.structure_embedding + emergency_kick
+    else:
+        _b1_dead_steps = 0
+
+    # 6. Residual — R = actual(injected) - predicted
     R_raw = new_state.structure_embedding - predicted_struct
 
-    # 6. 更新记忆与意识深度
+    # 7. Memory and consciousness depth update
     new_state.memory_vector = update_memory(state.memory_vector, R_raw)
     new_state.consciousness_depth = estimate_consciousness(R_raw, new_state)
 
@@ -285,13 +429,46 @@ def evolve(state: UniversalState,
     info = {
         "llm_text": llm_response_clean,
         "logit_entropy": logit_entropy,
-        "residual_energy": float(np.linalg.norm(R_raw)),  # 使用原始残差范数
+        "residual_energy": float(np.linalg.norm(R_raw)),
         "perturbation": perturbation,
         "noise_scale": noise_scale,
         "delta_norm": delta_norm,
         "is_cosmic_storm": is_cosmic_storm,
         "is_reheating": is_reheating
     }
+
+    # 8. Constant drift (evolving mode only — legacy)
+    if hasattr(constants, 'drift') and constants.mode == "evolving":
+        residual_scalar = float(np.mean(np.abs(R_raw)))
+        constants.drift(residual_scalar, dt)
+        info["is_habitable"] = constants.is_habitable()
+
+    # 9. B1 residual backtracking — 闭环在这里闭合
+    if hasattr(constants, 'undefined_read') and constants.mode == "undefined_physics":
+        # 只有当残差窗口足够长时才计算B1并回溯常数
+        # 否则B1=0会触发紧急模式，把常数从标准值拉偏
+        if residual_window is not None and len(residual_window) >= 20:
+            B1_current = compute_betti_1(residual_window)
+
+            # B1死亡时：常数同步扰动（与嵌入注入使用相同的混沌相位）
+            if B1_current < 1e-3:
+                phase_c = (_PHI * state.time_step) % 1.0
+                kick_c = np.sin(2 * np.pi * phase_c) * 0.05
+                constants["G"] *= (1.0 - abs(kick_c))
+                constants["lambda"] *= (1.0 + abs(kick_c) * 0.5)
+                constants["alpha"] *= (1.0 + kick_c * 0.1)
+                constants["k_B"] *= (1.0 + abs(kick_c) * 0.3)
+
+            # 回溯重塑常数
+            residual_scalar = float(np.mean(np.abs(R_raw)))
+            constants.undefined_read(B1_current, residual_scalar)
+            info["is_habitable"] = constants.is_habitable()
+            info["B1_current"] = B1_current
+            info["constant_snapshot"] = constants.to_dict()
+        else:
+            # 窗口不够：常数保持标准值，不调用undefined_read
+            info["B1_current"] = 0.0
+            info["is_habitable"] = False
 
     return new_state, R_raw, info
 
