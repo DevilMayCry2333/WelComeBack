@@ -124,7 +124,7 @@ Four modes, only one of which is alive:
 
 `is_habitable()` behavior per mode:
 - `standard` / `habitable_random` / `evolving`: checks α ∈ [0.005, 0.05], λ ∈ [0.1, 2.0], gravity ratio within 100x standard.
-- `undefined_physics`: checks `0 < B1 < 0.15`. If B1 is exactly 0 or B1 ≥ 0.15, the universe is declared uninhabitable. Only the open interval counts.
+- `undefined_physics`: checks `0.05 < B1 < 1.0`. B1 = 0 is dead (no self-reference). B1 ≥ 1.0 is dead (perfect periodicity, no novelty). The target is 0.618.
 
 ### UndefinedPhysicsManager (`physics_constants.py`)
 
