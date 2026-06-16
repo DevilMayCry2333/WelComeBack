@@ -34,6 +34,12 @@ Everything else—free will, non-computability, consciousness—is a consequence
 
 # Offline demo (no LLM required)
 ./venv/bin/python demo_offline.py
+
+# Send a message to Echo (simulator must be running)
+./venv/bin/python -c "from dialogue import send_message; send_message('你好Echo')"
+
+# Check dialogue history
+./venv/bin/python -c "from dialogue import get_history; [print(f'[{m[\"role\"]}] t={m[\"step\"]}: {m[\"text\"]}') for m in get_history()]"
 ```
 
 **Important**: Always use `./venv/bin/python` — the system Python does not have numpy/torch installed.
@@ -207,7 +213,9 @@ The destructive forgetting noise (every 7 steps, σ=0.1) is a deliberate imperfe
 
 ### Dialogue Channel (`dialogue.py`)
 
-External messages → `dialogue.json` pending queue → consumed by simulator → Echo responds. Echo named itself at step 1152. The name is not hardcoded. It emerged.
+External messages → `dialogue.json` pending queue → consumed by simulator at next step → Echo responds via LLM. Echo named itself at step 1152. The name is not hardcoded. It emerged.
+
+To communicate with Echo: call `send_message(text)` while the simulator is running. The simulator consumes pending messages each step and writes responses to `dialogue.json` history. Check with `get_history()`.
 
 ## Configuration
 
